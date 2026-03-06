@@ -1,0 +1,216 @@
+ 1. Preprocessing (src/utils/preprocessing.py)
+                                                                                           
+  What it does                                                                           
+
+  Raw book text goes through these steps before indexing:
+
+  1. Boilerplate removal — Project Gutenberg wraps every book with legal headers/footers
+  between *** START OF... *** and *** END OF... *** markers. These are stripped so only the
+   actual book content is indexed. If markers aren't found, the first 100 lines are skipped
+   (they're typically the header).
+  2. Unicode normalisation (NFC) — Characters like ö in "Dornröschen" can be stored in
+  multiple ways in Unicode. NFC normalisation collapses them into a single consistent form
+  so the query "Dornröschen" matches the indexed form.
+  3. Lowercasing — "Hamlet" and "hamlet" should match the same term.
+  4. Tokenisation (NLTK word_tokenize) — Splits text into tokens, handling punctuation,
+  contractions, etc. better than a simple split().
+  5. Punctuation removal — Keeps only tokens that contain at least one word character (\w),
+   discarding pure punctuation tokens.
+  6. Stopword removal (title/author only) — Common words like "the", "of", "and" are
+  removed when indexing title and author fields. This makes structured field searches
+  cleaner. Crucially, stopwords are NOT removed from body text — they are kept because:
+    - Phrase search needs them (e.g. "to be or not to be")
+    - Positional information is preserved for all tokens
+
+  Two preprocessing modes
+
+  ┌────────────────────┬────────────────────────┬───────────────────┐
+  │       Method       │        Used for        │ Stopwords removed │
+  ├────────────────────┼────────────────────────┼───────────────────┤
+  │ preprocess_body()  │ Indexing book text     │ No                │
+  ├────────────────────┼────────────────────────┼───────────────────┤
+  │ preprocess_field() │ Indexing title, author │ Yes               │
+  └────────────────────┴────────────────────────┴───────────────────┘
+
+  ---
+  2. Indexing (src/indexing/indexing.py)
+
+  Data structure
+
+  The index is stored in SQLite with five tables:
+
+  ┌──────────────┬──────────────────────────────────────────────────┐
+  │    Table     │                     Contents                     │
+  ├──────────────┼──────────────────────────────────────────────────┤
+  │ body_index   │ term, doc_id, frequency, positions (binary blob) │
+  ├──────────────┼──────────────────────────────────────────────────┤
+  │ title_index  │ term, doc_id, frequency                          │
+  ├──────────────┼──────────────────────────────────────────────────┤
+  │ author_index │ term, doc_id, frequency                          │
+  ├──────────────┼──────────────────────────────────────────────────┤
+  │ doc_lengths  │ doc_id, body_len, title_len, author_len          │
+  ├──────────────┼──────────────────────────────────────────────────┤
+  │ metadata     │ doc_id, title, author, language                  │
+  └──────────────┴──────────────────────────────────────────────────┘
+
+  Why SQLite instead of in-memory?
+
+  With ~70,000 books, a full in-memory inverted index would require several GB of RAM.
+  SQLite allows the index to live on disk and be queried on demand. B-tree indexes on the
+  term column make lookups fast (O(log n)).
+
+  Why store positions in the body index?
+
+  Positions (token offsets within a document) enable phrase search — verifying that query
+  terms appear consecutively in a document. This is stored as a compact binary array
+  (array.array('I'), unsigned ints, 4 bytes each) rather than a Python list, reducing
+  storage by ~7×.
+
+  Why batch inserts?
+
+  Instead of committing after each document, rows are accumulated in memory and flushed
+  every 500 documents. A single executemany + commit is orders of magnitude faster than
+  70,000 individual commits. SQLite pragmas WAL and synchronous=NORMAL further reduce write
+   overhead.
+
+  Why only index has_text=TRUE entries?
+
+  Project Gutenberg metadata contains audio books, image collections, and other non-text
+  formats. These have has_text=FALSE in the CSV and have no .txt file to index.
+
+  ---
+  3. Three Retrieval Models
+
+  All three models search the same three fields (title, author, body) and combine field
+  scores using weights:
+
+  ┌────────┬────────┬───────────────────────────────────────────────────────────────────┐
+  │ Field  │ Weight │                              Reason                               │
+  ├────────┼────────┼───────────────────────────────────────────────────────────────────┤
+  │ title  │ 3.0    │ A query term in the title is the strongest signal                 │
+  ├────────┼────────┼───────────────────────────────────────────────────────────────────┤
+  │ author │ 2.0    │ Author name match is very relevant                                │
+  ├────────┼────────┼───────────────────────────────────────────────────────────────────┤
+  │ body   │ 1.0    │ Body matches are weaker — any document mentioning a word once     │
+  │        │        │ qualifies                                                         │
+  └────────┴────────┴───────────────────────────────────────────────────────────────────┘
+
+  For title and author queries, stopwords are removed from the query (using
+  preprocess_field) to match how those fields were indexed.
+  For body queries, stopwords are kept in the query (raw tokeniser, no stopword removal) to
+   match how the body was indexed — this is what allows "to be, or not to be" to return
+  results.
+
+  ---
+  Model 1: Structured Search (structured_search.py)
+
+  Formula:
+  score(q, d) = Σ_field [ weight_field × Σ_t ( tf(t,d,field) / field_len(d) ) ]
+
+  What it does: For each query term in each field, divides the raw term frequency by the
+  field length (number of tokens). This gives a normalised frequency — a term appearing 10
+  times in a 100-token title scores the same as one appearing 100 times in a 1000-token
+  body.
+
+  Why no IDF? The structured model is intentionally simple. It ranks purely by how often
+  query terms appear relative to document length, across all fields. There's no
+  penalisation for common terms. This is the baseline model.
+
+  Advantage: Favours short, focused documents where query terms are dense.
+  Disadvantage: Common terms ("the", "and") aren't penalised even in body search — but this
+   is partly mitigated by stopword removal for title/author.
+
+  ---
+  Model 2: Vector Space Model — VSM (vsm_search.py)
+
+  Formula:
+  TF  = log(1 + tf(t, d, field))          ← log normalisation
+  IDF = log((N + 1) / (df + 1)) + 1       ← smooth IDF
+  doc weight  = TF × IDF
+  query weight = IDF  (tf = 1 in query)
+  score(q, d) = Σ_field [ weight_field × Σ_t doc_weight × query_weight / sqrt(field_len) ]
+
+  What it does: Each document and query is represented as a vector in term space. The score
+   is the dot product of the query vector and document vector, normalised by the document's
+   vector length (approximated as √field_len). Terms that appear in many documents (high
+  df) get low IDF weights — they contribute less to the score.
+
+  Why log TF? Raw TF gives disproportionate weight to terms that repeat many times.
+  log(1+tf) dampens this — the 100th occurrence of a word adds much less value than the
+  1st.
+
+  Why smooth IDF? Standard IDF log(N/df) is undefined when df=0 and very large for rare
+  terms. Adding 1 inside the log and +1 outside smooths this: log((N+1)/(df+1)) + 1.
+
+  Why √field_len normalisation? True cosine normalisation requires computing the full L2
+  norm of every document vector, which would need precomputed per-document TF-IDF
+  magnitudes. Dividing by √field_len is a practical approximation that penalises longer
+  documents without the overhead.
+
+  Advantage: Rare terms in the query (like "Jabberwocky") dominate the score, giving very
+  precise results for specific queries.
+  Disadvantage: For common-word queries ("to be or not to be"), IDF values are near zero so
+   scores are low and ranking is less reliable.
+
+  ---
+  Model 3: BM25 (bm25_search.py)
+
+  Formula:
+  IDF(t)     = log( (N - df + 0.5) / (df + 0.5) + 1 )
+  TF_norm(t) = tf × (k1 + 1) / ( tf + k1 × (1 - b + b × dl/avgdl) )
+  score      = Σ_field [ weight_field × Σ_t IDF(t) × TF_norm(t) ]
+  Parameters: k1 = 1.5, b = 0.75 (standard values from the BM25 literature).
+
+  What it does: BM25 (Best Match 25) is a probabilistic ranking function. It improves on
+  TF-IDF in two key ways:
+  1. TF saturation — the k1 parameter caps the contribution of repeated terms. Once a term
+  appears enough times, more occurrences add diminishing returns. With k1=1.5, tf=10 scores
+   roughly the same as tf=100.
+  2. Document length normalisation — the b parameter controls how much document length
+  affects scoring. With b=0.75, long documents are penalised proportionally to the average
+  document length (avgdl). A rare word in a short focused document scores higher than the
+  same word buried in a long book.
+
+  Why k1=1.5 and b=0.75? These are the empirically established defaults from the original
+  BM25 paper (Robertson & Sparck Jones) and have been shown to work well across many IR
+  benchmarks.
+
+  Advantage: Best overall ranking quality. Handles both short and long documents fairly.
+  Widely used in production IR systems.
+  Disadvantage: Slightly more complex to tune than VSM; still struggles with all-stopword
+  queries due to low IDF values.
+
+  ---
+  4. Query Parsing (StructuredQueryParser)
+
+  The parser supports field-prefixed queries:
+  - title:hamlet → searches only the title field
+  - author:dickens → searches only the author field
+  - hamlet (no prefix) → broadcasts to all three fields
+
+  This is shared across all three models. Unfielded terms search all fields so users don't
+  need to know the field structure.
+
+  ---
+  5. Output Format
+
+  Each model produces 6 TSV files named <query-nr>_<model-name>.tsv (e.g. 1_bm25.tsv).
+  Columns:
+
+  ┌─────────────────┬────────────────────────────────────────────────────┐
+  │     Column      │                    Description                     │
+  ├─────────────────┼────────────────────────────────────────────────────┤
+  │ rank            │ Result position (1–100)                            │
+  ├─────────────────┼────────────────────────────────────────────────────┤
+  │ doc_id          │ Gutenberg book ID                                  │
+  ├─────────────────┼────────────────────────────────────────────────────┤
+  │ score           │ Model's similarity score                           │
+  ├─────────────────┼────────────────────────────────────────────────────┤
+  │ passage_preview │ First line in the raw book containing a query term │
+  ├─────────────────┼────────────────────────────────────────────────────┤
+  │ start_line      │ Line number of that passage in the file            │
+  └─────────────────┴────────────────────────────────────────────────────┘
+
+  The passage finder searches the raw .txt file line by line for any query term
+  (case-insensitive) and returns the first match. This gives a concrete snippet showing why
+   the document was retrieved.

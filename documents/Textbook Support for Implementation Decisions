@@ -1,0 +1,140 @@
+Textbook Support for Implementation Decisions
+
+  Here are the relevant chapters and sections from Manning, Raghavan & Schütze (2009),
+  Introduction to Information Retrieval (Cambridge University Press), organized by
+  implementation decision:
+
+  ---
+  1. Preprocessing Pipeline
+
+  Tokenization (§2.2.1, p.22):
+  "The first step of determining the index units is tokenization... We need to choose what
+  constitutes a token."
+
+  Justifies splitting text into tokens as the first indexing step.
+
+  Stop Word Removal (§2.2.2, p.27–28):
+  "Some extremely common words which would appear to be of little value in helping select
+  documents matching a user need are excluded from the vocabulary entirely. These words are
+   called stop words."
+  "Using a stop list significantly reduces the number of postings that a system has to
+  store."
+
+  This justifies removing stop words from title and author fields (via preprocess_field()),
+   while body queries retain stop words — matching how the body was indexed with stopwords
+  present — to avoid zero-result queries like "to be, or not to be."
+
+  Normalization (§2.2.3, p.28–31):
+  "Token normalization is the process of canonicalizing tokens so that matches occur
+  despite superficial differences in the character sequences of the tokens."
+  "The most standard way to normalize is to implicitly create equivalence classes, which
+  are normally named after one member of the set. A simple normalization form is to put
+  words in lowercase."
+
+  Justifies Unicode normalization and lowercasing.
+
+  Stemming / Porter Algorithm (§2.2.4, p.32–35):
+  "Stemming usually refers to a crude heuristic process that chops off the ends of words in
+   the hope of achieving this goal correctly most of the time, and often includes the
+  removal of derivational affixes."
+  "The most common algorithm for stemming English... is Porter's algorithm (Porter, 1980)."
+
+  Supports use of NLTK's Porter stemmer during preprocessing.
+
+  ---
+  2. Positional Index
+
+  (§2.4.2, p.41–44):
+  "In a positional index, for each term in the vocabulary, we store postings of the form
+  docID: ⟨position1, position2, ...⟩, where each position is a token index in the
+  document."
+  "Positional indexes are substantially larger than a regular inverted index, but they
+  allow phrase queries."
+
+  Justifies storing position arrays (as binary array.array('I') blobs) in the body_index
+  table for phrase matching.
+
+  ---
+  3. Index Construction
+
+  (Chapter 4, p.67–85 — BSBI & SPIMI):
+  "For large document collections, the index has to be constructed using an algorithm that
+  works with limited main memory. Instead of loading all postings into memory at once, we
+  build the index in a blocked, sorted fashion."
+
+  Justifies the batch-insert approach (BATCH_SIZE=500) with SQLite WAL mode for building
+  the index over 70,000+ documents without memory issues.
+
+  ---
+  4. Structured Search (TF Scoring with Field Weights)
+
+  Weighted Zone Scoring (§6.1.1, p.112–115):
+  "In weighted zone scoring, we assign a weight to each zone of the document... the score
+  of a document d is: score(d,q) = Σ gᵢ × sᵢ(d,q) where gᵢ are the zone weights and sᵢ is
+  the boolean score in zone i."
+  "The weights gᵢ sum to 1 and are between 0 and 1."
+
+  This directly justifies the field weights used: title=3.0, author=2.0, body=1.0
+  (normalized internally when combining scores across fields).
+
+  TF Weighting (§6.2, p.117–118):
+  "A document with a term frequency of tf has more relevance signal than a document with tf
+   = 1... The raw term frequency tf_{t,d} of term t in document d is the number of times t
+  occurs in d."
+
+  Justifies using raw TF normalized by document length (tf / doc_len) for structured
+  scoring.
+
+  ---
+  5. Vector Space Model (VSM)
+
+  TF–IDF and Vector Space Model (§6.3, p.120–126):
+  "We now combine the notions of tf and idf... The tf-idf weight of a term is the product
+  of its tf weight and its idf weight: tf-idf_{t,d} = tf_{t,d} × idf_t."
+  "We can view each document as a vector with one real-valued component for each term. The
+  cosine similarity between two documents is then: sim(d₁, d₂) = (d₁/|d₁|) · (d₂/|d₂|)."
+
+  Justifies the cosine similarity formula used in VSM and normalizing document vectors by
+  their length.
+
+  Log-frequency TF Weighting (§6.4.1, p.127):
+  "Log frequency weighting: the log frequency weight of term t in d is: wf_{t,d} = 1 +
+  log(tf_{t,d}) if tf_{t,d} > 0, else 0."
+
+  Justifies the math.log(1 + tf) formula used in vsm_search.py instead of raw TF, which
+  prevents high-frequency terms from dominating scores.
+
+  Smooth IDF (§6.2.2, p.118–119):
+  "The idf of a rare term is high, whereas the idf of a frequent term is low... idf_t =
+  log(N / df_t)."
+
+  The smooth variant log((N+1)/(df+1)) + 1 prevents zero IDF for universal terms and avoids
+   division by zero.
+
+  ---
+  6. BM25 (Okapi BM25)
+
+  (§11.4.3, p.232–234):
+  "The Okapi BM25 formula, which was developed as part of the Okapi system... is: RSV_d =
+  Σ_{t∈q} log[N/df_t] · (k₁+1)tf_{td} / (k₁((1-b)+b·L_d/L_avg) + tf_{td})"
+  "where L_d is the length of document d and L_avg is the average document length in the
+  collection. The constants k₁ and b are free parameters. A typical k₁ value is 1.2–2.0 and
+   b = 0.75."
+
+  This is the exact formula implemented in bm25_search.py with K1=1.5, B=0.75. The textbook
+   also explains:
+  "The term-frequency component... saturates: as tf increases, the component approaches
+  k₁+1 asymptotically... The b parameter controls the extent to which the document length
+  normalizes the tf."
+
+  ---
+  7. Multi-Field Search Architecture
+
+  Field-specific scoring supports the design of searching across title, author, and body
+  with different weights in all three models. This mirrors the zone scoring concept
+  extended to probabilistic and vector space scoring functions.
+
+  ---
+  This material covers all major implementation choices. You can cite specific page numbers
+   and section numbers in your report. Let me know if you need anything else for the
+  assignment.

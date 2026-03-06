@@ -8,26 +8,19 @@ from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
 
-# Initialize once
 STOPWORDS = set(stopwords.words('english'))
 STEMMER = PorterStemmer()
 
 
 class Preprocessor:
     def __init__(self, use_stemming=False):
-        """
-        use_stemming: Boolean flag to enable/disable stemming.
-        """
         self.use_stemming = use_stemming
-        self.stemmer = nltk.stem.PorterStemmer() if use_stemming else None
 
-
+    # ------------------------------------------------------------
+    # Boilerplate Removal
+    # ------------------------------------------------------------
     def remove_gutenberg_boilerplate(self, text):
-        """
-        Extract content between START/END markers if present.
-        Falls back to raw text if markers aren't found.
-        """
-        start_pattern = r"\*\*\* START OF.*?\*\*\*" # .* means - Delete all the text after START OF 
+        start_pattern = r"\*\*\* START OF.*?\*\*\*"
         end_pattern = r"\*\*\* END OF.*?\*\*\*"
 
         start_match = re.search(start_pattern, text, re.IGNORECASE | re.DOTALL)
@@ -36,78 +29,61 @@ class Preprocessor:
         if start_match and end_match:
             return text[start_match.end():end_match.start()].strip()
 
-        # Fallback: remove first ~500 lines heuristically
         lines = text.split("\n")
         return "\n".join(lines[100:]).strip()
 
-
-    def normalize_unicode(self, text: str) -> str:
-        """
-        Normalize unicode text (preserves accented characters).
-        """
+    # ------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------
+    def normalize_unicode(self, text):
         return unicodedata.normalize("NFC", text)
 
-    def lowercase(self, text: str) -> str:
-        """
-        Case normalization.
-        """
+    def lowercase(self, text):
         return text.lower()
 
-    def tokenize(self, text: str) -> list[str]:
-        """
-        Tokenizes text using NLTK's Punkt tokenizer.
-        """
+    def tokenize(self, text):
         return word_tokenize(text)
 
-    def remove_punctuation(self, tokens: list[str]) -> list[str]:
-        """
-        Removes tokens that are purely punctuation.
-        """
+    def remove_punctuation(self, tokens):
         return [t for t in tokens if re.search(r'\w', t)]
 
-    # def remove_stopwords(self, tokens: list[str]) -> list[str]:
-    #     """
-    #     Removes common English stopwords.
-    #     """
-    #     return [t for t in tokens if t not in STOPWORDS]
-
-    def apply_stemming(self, tokens: list[str]) -> list[str]:
-        """
-        Applies Porter stemming.
-        """
+    def apply_stemming(self, tokens):
         return [STEMMER.stem(t) for t in tokens]
 
-    def preprocess(self, raw_text: str) -> list[str]:
-        """
-        Full preprocessing pipeline.
-        """
+    # ------------------------------------------------------------
+    # BODY preprocessing (keep stopwords for phrase correctness)
+    # ------------------------------------------------------------
+    def preprocess_body(self, raw_text):
         text = self.remove_gutenberg_boilerplate(raw_text)
         text = self.normalize_unicode(text)
         text = self.lowercase(text)
 
         tokens = self.tokenize(text)
         tokens = self.remove_punctuation(tokens)
-        # tokens = self.remove_stopwords(tokens) Not done for keeping stopwords for term search
 
         if self.use_stemming:
             tokens = self.apply_stemming(tokens)
 
         return tokens
 
-    # def preprocess_field(self, value: str) -> List[str]:
-    #         """
-    #         Preprocess small fields like title/author:
-    #         - normalize unicode
-    #         - tokenize
-    #         - remove punctuation
-    #         - (optionally) stopwords (kept ON for simplicity; can be OFF if desired)
-    #         """
-    #         if not value:
-    #             return []
-    #         value = self.normalize_unicode(value)
-    #         tokens = self.tokenize(value)
-    #         tokens = self.remove_punctuation(tokens)
-    #         tokens = self.remove_stopwords(tokens)  # You may disable for author names if you prefer
-    #         if self.use_stemming:
-    #             tokens = self.apply_stemming(tokens)
-    #         return tokens
+    # ------------------------------------------------------------
+    # FIELD preprocessing (title/author)
+    # Keep stopwords OFF by default for clean structured search
+    # ------------------------------------------------------------
+    def preprocess_field(self, value):
+        if not value:
+            return []
+
+        text = self.normalize_unicode(value)
+        text = self.lowercase(text)
+
+        tokens = self.tokenize(text)
+        tokens = self.remove_punctuation(tokens)
+
+        # For structured fields, remove stopwords
+        tokens = [t for t in tokens if t not in STOPWORDS]
+
+        if self.use_stemming:
+            tokens = self.apply_stemming(tokens)
+
+        return tokens

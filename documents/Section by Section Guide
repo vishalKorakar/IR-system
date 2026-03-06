@@ -1,0 +1,162 @@
+ Section by Section Guide
+
+  1. Abstract (half a page)
+
+  Keep it short — 4–5 sentences covering:
+  - What you built (IR system over Project Gutenberg)
+  - What methods you used (inverted index, TF, VSM, BM25)
+  - What you evaluated (6 queries, 3 models)
+  - Key finding (which model performed best and why)
+
+  ---
+  2. Introduction (half to 1 page)
+
+  Cover these points:
+  - Problem: Finding relevant books in 70,000+ document collection
+  - System architecture diagram — draw a simple flowchart:
+  Books + Metadata → Preprocessing → Inverted Index → Query Parser → [Structured | VSM |
+  BM25] → Ranked Results
+  - Why IR is non-trivial (vocabulary mismatch, scale, ranking quality)
+  - Brief overview of what each section covers
+
+  ---
+  3. Indexing (1–1.5 pages)
+
+  This needs the most detail. Cover:
+
+  Document Analysis & Preprocessing:
+  - Unicode normalisation → lowercase → tokenisation → punctuation removal
+  - Stop word removal for title/author fields (cite Manning §2.2.2)
+  - Why stop words kept in body (queries like "to be or not to be" would return 0 results)
+  - Porter stemmer (cite Manning §2.2.4)
+
+  Index Construction:
+  - Inverted index structure (cite Manning §1.2)
+  - Three separate indexes: body_index, title_index, author_index
+  - Why SQLite — persistence, fast lookup, no external library
+  - Positional index for body — stores word positions as binary blobs (cite Manning §2.4.2)
+  - Batch insert approach (BATCH_SIZE=500) for memory efficiency
+
+  Data Structures:
+  - Posting list: {term → [(doc_id, tf), ...]}
+  - Metadata table: title, author, has_text flag
+  - doc_lengths and avgdl tables for BM25 normalisation
+
+  ---
+  4. Ranking (1.5–2 pages)
+
+  Describe all three models and why you chose those approaches:
+
+  Query Parser:
+  - Supports field:term, field:"phrase", plain terms
+  - Unfielded terms broadcast to ALL fields (title + author + body)
+  - Field weights: title=3.0, author=2.0, body=1.0 (cite Manning §6.1.1 weighted zone
+  scoring)
+
+  Structured Search (TF scoring):
+  - Score = Σ field_weight × (tf / doc_len)
+  - Simple, interpretable baseline
+  - No IDF — doesn't penalise common terms
+
+  VSM (TF-IDF Cosine Similarity):
+  - TF: log(1 + tf) — cite Manning §6.4.1
+  - IDF: log((N+1)/(df+1)) + 1 — smooth variant
+  - Cosine normalisation by √doc_len
+  - Why VSM: handles multi-term queries, ranks by semantic closeness to query vector
+
+  BM25:
+  - Full Okapi BM25 formula (cite Manning §11.4.3)
+  - K1=1.5, B=0.75 — cite Manning for typical values
+  - Why BM25: length normalisation, TF saturation, state-of-the-art bag-of-words model
+
+  ---
+  5. Evaluation (1–1.5 pages)
+
+  This is where you show critical thinking:
+
+  Metrics used and why:
+  - P@10 — user-centric, most practical (cite Manning §8.3)
+  - NDCG@10 — position-sensitive, handles graded relevance (cite Manning §8.4)
+  - MRR — ideal for known-item queries like "Jabberwocky" (cite Manning §8.4)
+
+  Relevance judgement process:
+  - Pooling method — top 20 from each model, ~182 unique documents judged
+  - Graded relevance: 2 = highly relevant, 1 = partially relevant, 0 = not relevant
+
+  Results table (fill after running compute_metrics.py):
+
+  ┌───────┬─────────┬───────┬───────┬─────────┬───────┬───────┬─────────┬──────┬───────┐
+  │ Query │  P@10   │ P@10  │ P@10  │  NDCG   │ NDCG  │ NDCG  │  MRR    │ MRR  │ MRR   │
+  │       │ Struct  │  VSM  │ BM25  │ Struct  │  VSM  │ BM25  │ Struct  │ VSM  │ BM25  │
+  ├───────┼─────────┼───────┼───────┼─────────┼───────┼───────┼─────────┼──────┼───────┤
+  │ Q1    │         │       │       │         │       │       │         │      │       │
+  ├───────┼─────────┼───────┼───────┼─────────┼───────┼───────┼─────────┼──────┼───────┤
+  │ ...   │         │       │       │         │       │       │         │      │       │
+  ├───────┼─────────┼───────┼───────┼─────────┼───────┼───────┼─────────┼──────┼───────┤
+  │ Mean  │         │       │       │         │       │       │         │      │       │
+  └───────┴─────────┴───────┴───────┴─────────┴───────┴───────┴─────────┴──────┴───────┘
+
+  Discussion — advantages and disadvantages:
+
+  ┌─────────────┬─────────────────────────────────────┬────────────────────────────────┐
+  │    Model    │              Advantage              │          Disadvantage          │
+  ├─────────────┼─────────────────────────────────────┼────────────────────────────────┤
+  │ Structured  │ Simple, fast, interpretable         │ No IDF — common terms score    │
+  │ TF          │                                     │ same as rare terms             │
+  ├─────────────┼─────────────────────────────────────┼────────────────────────────────┤
+  │ VSM         │ Handles multi-term queries, IDF     │ Cosine similarity can favour   │
+  │             │ boosts rare terms                   │ short documents                │
+  ├─────────────┼─────────────────────────────────────┼────────────────────────────────┤
+  │ BM25        │ Best length normalisation, TF       │ Two parameters (K1, B) need    │
+  │             │ saturation prevents spam            │ tuning                         │
+  └─────────────┴─────────────────────────────────────┴────────────────────────────────┘
+
+  Query-specific observations:
+  - "Jabberwocky" — all 3 models find Carroll's poem in top 3, BM25 ranks it #1
+  - "to be or not to be" — all stopwords, models return low scores but non-zero (explain
+  why)
+  - "Dornröschen" — German term, discuss how preprocessing handles non-ASCII
+  - "Philip K Dick" — name query, explain author field weighting advantage
+
+  ---
+  6. Conclusions (half a page)
+
+  Cover all four of these:
+  - What worked well: BM25 performed best overall, field weighting helped author/title
+  queries
+  - What did not: Stopword queries degrade all 3 models, no semantic understanding
+  - What you would change: Query expansion, phrase search, better German language support
+  - Future extensions: Neural retrieval (BERT), learning to rank, user feedback
+
+  ---
+  Key Things That Lose Marks
+
+  ┌───────────────────────────────────────────┬────────────────────────────────────────┐
+  │                  Mistake                  │              How to avoid              │
+  ├───────────────────────────────────────────┼────────────────────────────────────────┤
+  │ No references for implementation choices  │ Cite Manning for every major decision  │
+  ├───────────────────────────────────────────┼────────────────────────────────────────┤
+  │ Describing code instead of explaining     │ Say WHY, not just WHAT                 │
+  │ decisions                                 │                                        │
+  ├───────────────────────────────────────────┼────────────────────────────────────────┤
+  │ Missing advantages/disadvantages of each  │ Required explicitly by the spec        │
+  │ model                                     │                                        │
+  ├───────────────────────────────────────────┼────────────────────────────────────────┤
+  │ Report under 5 or over 8 pages            │ Check length before submitting         │
+  ├───────────────────────────────────────────┼────────────────────────────────────────┤
+  │ No system architecture diagram            │ Draw it in Introduction                │
+  ├───────────────────────────────────────────┼────────────────────────────────────────┤
+  │ Evaluation with no numbers                │ Run compute_metrics.py after judging   │
+  │                                           │ pool.csv                               │
+  ├───────────────────────────────────────────┼────────────────────────────────────────┤
+  │ Wrong template                            │ Use ACM sigconf only                   │
+  └───────────────────────────────────────────┴────────────────────────────────────────┘
+
+  ---
+  Order to Write It
+
+  1. Indexing — you know this best, write it first
+  2. Ranking — explain each model with formulas
+  3. Evaluation — complete pool.csv judgements first, then write with actual numbers
+  4. Introduction + Abstract — write these last when you know the full picture
+  5. Conclusions — reflect honestly on limitations

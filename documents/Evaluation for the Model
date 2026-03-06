@@ -1,0 +1,5 @@
+Evaluation for the Model:
+
+The problem with binary:
+  A book that is the Jabberwocky poem and a book that mentions the word once in passing are
+   both marked "1" — but they are clearly not equally useful to the user.

@@ -1,0 +1,523 @@
+  1. Introduction                                                                          
+                                                                                           
+  Information Retrieval (IR) is the science of obtaining relevant information from large 
+  unstructured collections in response to an information need expressed as a query [Manning
+   et al., 2009, Ch. 1, p. 1]. With the explosion of digitally available text, the ability
+  to efficiently locate relevant documents has become a fundamental requirement of modern
+  computing systems.
+
+  This report describes the design and implementation of an IR system built over a subset
+  of Project Gutenberg — a corpus of over 70,000 public-domain books in plain-text format.
+  The system is capable of indexing this large collection and responding to free-text
+  queries by returning a ranked list of relevant documents.
+
+  Retrieving relevant books from a collection of this scale presents three non-trivial
+  challenges. First, vocabulary mismatch — users express their information need in words
+  that may differ from those used in relevant documents [Manning et al., 2009, §2.1, p.
+  19]. Second, scale — linearly scanning 70,000 documents for every query is
+  computationally infeasible, requiring efficient index structures for fast lookup. Third,
+  ranking quality — identifying documents that merely contain a query term is insufficient;
+   results must be ordered by degree of relevance using principled scoring functions.
+
+  To address these challenges, the system is built around the following pipeline:
+
+  Raw Books + Metadata CSV
+          ↓
+    Preprocessing (normalisation, tokenisation, stop word removal)
+          ↓
+    Inverted Index (SQLite — body, title, author)
+          ↓
+    Query Parser (field-aware, supports structured and free-text queries)
+          ↓
+    ┌─────────────┬──────────────┬──────────┐
+    │  Structured │     VSM      │   BM25   │
+    │  (TF-based) │  (TF-IDF)   │  (Okapi) │
+    └─────────────┴──────────────┴──────────┘
+          ↓
+    Ranked TSV Output (top 100 per query)
+
+  Three retrieval models are implemented: a structured field-based search using term
+  frequency (TF) scoring, a Vector Space Model (VSM) using TF-IDF cosine similarity, and
+  BM25 (Okapi), a probabilistic ranking function. Each model is evaluated qualitatively
+  against six predefined queries, and quantitatively using Precision@10, NDCG@10, and MRR.
+
+  The remainder of this report is structured as follows: Section 2 describes the indexing
+  pipeline, Section 3 details the three retrieval models, Section 4 presents the
+  evaluation, and Section 5 concludes with findings and future directions.
+
+  Reference: Manning, Raghavan & Schütze, Introduction to Information Retrieval, Cambridge
+  University Press, 2009. Chapter 1 (p. 1–4), §2.1 (p. 19).
+
+2. Indexing (Enhanced Version)                                                           
+                  
+  2.1 Document Collection
+
+  The corpus originates from Project Gutenberg and initially comprises 75,294 plain-text
+  .txt files. After filtering, the final indexed collection contains 70,694 documents,
+  arrived at through the following process:
+
+  75,294 total text files
+     − 4,534 excluded: no matching metadata or has_text ≠ TRUE
+               (audio books, image collections, non-textual formats)
+  = 70,760 valid candidates
+     −    66 excluded: empty content after boilerplate removal
+               (65 empty stubs containing only Gutenberg policy text,
+                1 corrupt/binary file)
+  = 70,694 documents successfully indexed
+
+  The 65 empty stub documents (IDs: 2291, 4461–4727 range) contained only the standard
+  Project Gutenberg *** START OF *** / *** END OF *** markers with no body content between
+  them. These were correctly identified and skipped by the indexer's empty-token check.
+
+  ---
+  2.2 Preprocessing Pipeline
+
+  The preprocessing stage transforms raw textual data into a normalised token stream
+  suitable for indexing. Following standard IR practice [Manning et al., 2009, Ch. 2], the
+  following steps are applied:
+
+  Step 1 — Boilerplate Removal.
+  Every Project Gutenberg file begins with a legal header and ends with a licence footer,
+  delimited by *** START OF THE PROJECT GUTENBERG EBOOK *** and *** END OF THE PROJECT
+  GUTENBERG EBOOK ***. These sections are detected using regular expressions and stripped
+  before any indexing occurs. Where these markers are absent, the first 100 lines are
+  discarded as a conservative fallback. This prevents boilerplate phrases such as "Project
+  Gutenberg" from artificially inflating term frequencies across the corpus, which is
+  particularly important for query 5 ("Gutenberg").
+
+  Step 2 — Unicode Normalisation (NFC).
+  Text is normalised to Unicode NFC form using Python's unicodedata module. This
+  canonicalises characters that may be represented differently at the byte level — for
+  example, the German umlaut ö in Dornröschen — ensuring consistent matching regardless of
+  encoding variant.
+  "Token normalisation is the process of canonicalising tokens so that matches occur
+  despite superficial differences in the character sequences of the tokens." [Manning et
+  al., §2.2.3, p. 28]
+
+  Step 3 — Lowercasing.
+  All text is converted to lowercase so that Jabberwocky, jabberwocky, and JABBERWOCKY
+  resolve to the same index entry.
+
+  Step 4 — Tokenisation.
+  The NLTK word_tokenize function splits text into individual tokens, correctly handling
+  punctuation, contractions, and hyphenated terms.
+  "The first step of determining the index units is tokenisation." [Manning et al., §2.2.1,
+   p. 22]
+
+  Step 5 — Punctuation Removal.
+  Tokens containing no alphanumeric characters are discarded, removing standalone
+  punctuation marks and symbols from the token stream.
+
+  Step 6 — Stop Word Handling (field-dependent).
+
+  This is a critical design decision. Stop words are treated differently depending on the
+  field being indexed:
+
+  - Title and author fields: Stop words are removed using NLTK's English stop word list.
+  This reduces index size and improves precision for structured field queries, where
+  function words such as "the" or "of" carry no discriminative information.
+  "A stop list significantly reduces the number of postings that a system has to store."
+  [Manning et al., §2.2.2, p. 27]
+  - Body field: Stop words are intentionally retained. Stopwords were retained in the body
+  index to preserve positional consistency required for phrase query processing. Although
+  high-frequency terms have limited discriminative power, ranking models such as BM25
+  inherently reduce their influence through inverse document frequency (IDF) weighting.
+  Furthermore, removing stop words from the body index would make query 1 — "to be, or not
+  to be" — return zero results, as every token in that query is a stop word.
+
+  Step 7 — Stemming (optional).
+  The Porter stemmer [Porter, 1980] is available via NLTK but disabled by default, as the
+  Project Gutenberg corpus spans several centuries of English and many languages, where
+  aggressive stemming risks conflating historically distinct word forms.
+  "The most common algorithm for stemming English is Porter's algorithm." [Manning et al.,
+  §2.2.4, p. 32]
+
+  ---
+  2.3 Index Architecture — Why Separate Field Indexes
+
+  Three separate inverted indexes are maintained — body_index, title_index, and
+  author_index — rather than a single unified index. This design was motivated by two
+  requirements:
+
+  1. The assignment explicitly requires search in structured data. Metadata fields (title,
+  author) are structured and warrant different preprocessing (stop word removal) and
+  different field weights in scoring. Maintaining separate indexes makes it straightforward
+   to apply field-specific scoring weights (title = 3.0, author = 2.0, body = 1.0).
+  2. Evaluation clarity. Separate indexes allow clear comparison of what structured search
+  does well (precise author/title matching) versus what unstructured body search achieves
+  (content-level relevance). For example, query 3 ("Philip K Dick") benefits directly from
+  the author index, which correctly identifies books written by him rather than books that
+  merely mention his name in the body text.
+
+  ---
+  2.4 Data Structures
+
+  The inverted index is stored in a SQLite relational database (index.db) with the
+  following schema:
+
+  ┌──────────────┬────────────────────────────────────┬────────────────────────────────┐
+  │    Table     │              Columns               │            Purpose             │
+  ├──────────────┼────────────────────────────────────┼────────────────────────────────┤
+  │ body_index   │ term, doc_id, freq, positions      │ Full-text body terms with      │
+  │              │ (BLOB)                             │ positions                      │
+  ├──────────────┼────────────────────────────────────┼────────────────────────────────┤
+  │ title_index  │ term, doc_id, freq                 │ Title field terms              │
+  ├──────────────┼────────────────────────────────────┼────────────────────────────────┤
+  │ author_index │ term, doc_id, freq                 │ Author field terms             │
+  ├──────────────┼────────────────────────────────────┼────────────────────────────────┤
+  │ doc_lengths  │ doc_id, body_len, title_len,       │ Per-field document lengths     │
+  │              │ author_len                         │                                │
+  ├──────────────┼────────────────────────────────────┼────────────────────────────────┤
+  │ metadata     │ doc_id, title, author, language    │ Structured book metadata       │
+  └──────────────┴────────────────────────────────────┴────────────────────────────────┘
+
+  Why SQLite?
+  SQLite was chosen over an in-memory data structure for three reasons:
+
+  1. Memory safety at scale. With approximately 70,000 books, holding the entire index in
+  RAM simultaneously is infeasible. A Python dictionary can only be saved all at once — you
+   cannot write half a dictionary to disk, clear RAM, and continue. SQLite allows writing
+  one row at a time directly to disk as each document is processed. At any point in time,
+  RAM holds only the current batch of 500 documents; the remainder is safely persisted on
+  disk.
+  2. Built-in to Python. No external dependencies are required — import sqlite3 is part of
+  the Python standard library, satisfying the assignment's constraint against external IR
+  libraries.
+  3. Selective loading at query time. At search time, only the posting list for the
+  specific query terms is loaded — not the entire index — making query processing fast and
+  memory-efficient regardless of corpus size.
+
+  Positional index for body:
+  Word positions are stored as binary-serialised array.array('I') (unsigned 32-bit
+  integers) in the positions BLOB column of body_index. This compact representation is
+  approximately 7× smaller than storing positions as Python lists and enables phrase-level
+  lookups. The positional index is essential for phrase search — verifying that query terms
+   appear consecutively in a document requires knowing the exact position of each token.
+  "In a positional index, for each term we store postings of the form docID: ⟨position1,
+  position2, ...⟩" [Manning et al., §2.4.2, p. 42]
+
+  ---
+  2.5 Index Construction
+
+  Documents are processed one at a time in batches of 500 (BATCH_SIZE = 500). Rather than
+  loading all 70,000 books into memory before writing to disk, each document is read,
+  preprocessed, and its rows accumulated in small in-memory buffers. Every 500 documents,
+  the buffers are flushed to SQLite in a single transaction using executemany, then
+  cleared. This bounds peak RAM usage to approximately 500 documents at any point during
+  construction.
+
+  SQLite is configured with:
+  - WAL (Write-Ahead Logging): Allows concurrent reads during writes and improves
+  bulk-insert throughput
+  - NORMAL synchronous mode: Ensures data safety without the overhead of full fsync after
+  every write
+  - 64 MB page cache: Reduces disk I/O during the insertion phase
+
+  B-tree term lookup indexes are created on the term column of each index table after all
+  documents are inserted — not incrementally during insertion. Building an index over an
+  already-populated table is significantly faster than maintaining it during bulk
+  insertion, as the database can sort and construct the B-tree in a single optimised pass.
+  "Index construction algorithms must deal with the constraint that memory is insufficient
+  for large collections." [Manning et al., Ch. 4, p. 67]
+
+  Document length tracking:
+  During indexing, the token length of each field (body_len, title_len, author_len) is
+  computed and stored in the doc_lengths table. The average document length (avgdl) for
+  each field is derived from this table at query time. Both values are required by the BM25
+   scoring formula for document length normalisation.
+
+  References: Manning et al., §2.2.1 (p. 22), §2.2.2 (p. 27–28), §2.2.3 (p. 28–31), §2.2.4
+  (p. 32–35), §2.4.2 (p. 41–44), Ch. 4 (p. 67–85). NLTK: Bird, Klein & Loper, Natural
+  Language Processing with Python, O'Reilly, 2009, Ch. 3.
+
+  3. Ranking
+
+  3.1 Query Parser
+
+  All three retrieval models share a common query parser that supports the following input
+  formats:
+
+  ┌───────────────────────┬──────────────────────┬────────────────────────────────┐
+  │     Input format      │       Example        │           Behaviour            │
+  ├───────────────────────┼──────────────────────┼────────────────────────────────┤
+  │ Field-prefixed term   │ title:Hamlet         │ Searches title field only      │
+  ├───────────────────────┼──────────────────────┼────────────────────────────────┤
+  │ Field-prefixed phrase │ author:"Philip Dick" │ Searches author field only     │
+  ├───────────────────────┼──────────────────────┼────────────────────────────────┤
+  │ Plain term            │ Jabberwocky          │ Broadcasts to all three fields │
+  ├───────────────────────┼──────────────────────┼────────────────────────────────┤
+  │ Plain phrase          │ "to be or not to be" │ Broadcasts to all three fields │
+  └───────────────────────┴──────────────────────┴────────────────────────────────┘
+
+  Unfielded query terms are broadcast to all three fields (title, author, body)
+  simultaneously. This allows natural language queries such as "Philip K Dick" to match
+  both author metadata and body text without requiring the user to specify field prefixes.
+  Field weights are applied during scoring:
+
+  ┌────────┬────────┐
+  │ Field  │ Weight │
+  ├────────┼────────┤
+  │ Title  │ 3.0    │
+  ├────────┼────────┤
+  │ Author │ 2.0    │
+  ├────────┼────────┤
+  │ Body   │ 1.0    │
+  └────────┴────────┘
+
+  Title and author fields are given higher weight as an exact match in metadata is a
+  stronger relevance signal than a body mention. This follows the weighted zone scoring
+  framework described in Manning et al.:
+  "In weighted zone scoring, we assign a weight to each zone of the document... the score
+  of a document is the weighted sum of zone scores." [Manning et al., §6.1.1, p. 112]
+
+  3.2 Structured Search (TF Scoring)
+
+  The structured retrieval model scores documents using raw term frequency normalised by
+  document length:
+
+  Score(q, d) = Σ_field  field_weight × Σ_t  ( tf(t, d, field) / field_len(d) )
+
+  This model serves as an interpretable baseline. It rewards documents in which query terms
+   appear frequently relative to document length, but applies no IDF component — a term
+  appearing in every document receives the same weight as a rare term.
+
+  "The raw term frequency tf(t,d) of term t in document d is the number of times t occurs
+  in d." [Manning et al., §6.2, p. 117]
+
+  Advantage: Simple, fast, and interpretable — every score is directly proportional to how
+  often the query term appears in the document.
+
+  Disadvantage: Without IDF, common terms (e.g., "English") receive the same treatment as
+  rare discriminative terms (e.g., "Jabberwocky"), reducing ranking precision for
+  common-word queries.
+
+  3.3 Vector Space Model (VSM)
+
+  The VSM represents both documents and queries as vectors in a high-dimensional term
+  space, ranking documents by their cosine similarity to the query vector [Manning et al.,
+  §6.3, p. 120].
+
+  TF weighting: Log-normalised TF is used to dampen the effect of high raw frequencies:
+  tf_norm = log(1 + tf)
+  "Log frequency weighting: wf(t,d) = 1 + log(tf(t,d)) if tf > 0." [Manning et al., §6.4.1,
+   p. 127]
+
+  IDF weighting: A smoothed IDF variant is used to avoid zero division and handle terms
+  appearing in all documents:
+  idf = log((N + 1) / (df + 1)) + 1
+
+  Document score per field:
+  score(t, d, field) = tf_norm × idf²
+  The query term weight is treated as idf (assuming query term frequency = 1), and the
+  document weight is tf_norm × idf, giving idf² in the dot product.
+
+  Cosine normalisation: Scores are divided by √field_len to normalise for document length,
+  preventing long documents from dominating results purely due to higher absolute term
+  counts.
+
+  "The cosine similarity between two vectors is their dot product divided by the product of
+   their magnitudes." [Manning et al., §6.3, p. 121]
+
+  Advantage: IDF down-weights common terms, improving precision for discriminative queries.
+   Cosine normalisation fairly compares short poems to long novels.
+
+  Disadvantage: The √field_len normalisation is an approximation of true cosine similarity
+  and may not fully account for document length variation in a corpus as heterogeneous as
+  Project Gutenberg.
+
+  3.4 BM25 (Okapi BM25)
+
+  BM25 is a probabilistic ranking function that extends TF-IDF with explicit document
+  length normalisation and TF saturation [Manning et al., §11.4.3, p. 232]:
+
+  BM25(t, d) = IDF(t) × (tf × (K1 + 1)) / (tf + K1 × (1 − B + B × dl/avgdl))
+
+  IDF(t) = log((N − df + 0.5) / (df + 0.5) + 1)
+
+  Parameters used: K1 = 1.5, B = 0.75. These values fall within the ranges recommended by
+  Manning et al.:
+  "A typical value of k1 is between 1.2 and 2, and b = 0.75." [Manning et al., §11.4.3, p.
+  234]
+
+  K1 controls TF saturation — as term frequency increases, the score approaches an
+  asymptote of K1 + 1 = 2.5, preventing a single repeated term from dominating. B controls
+  length normalisation — at B = 0.75, document length is strongly but not fully normalised
+  against the corpus average.
+
+  Advantage: Best-performing model in practice. TF saturation prevents term-spamming;
+  length normalisation fairly compares short poems (e.g., Jabberwocky) to long novels. The
+  IDF formula directly estimates term informativeness using the probabilistic framework.
+
+  Disadvantage: Two free parameters (K1, B) require tuning; the default values used here
+  were not optimised for this specific corpus.
+
+  References: Manning et al., §6.1.1 (p. 112–115), §6.2 (p. 117–119), §6.3 (p. 120–126),
+  §6.4.1 (p. 127), §11.4.3 (p. 232–234).
+
+  ---
+  4. Evaluation
+
+  4.1 Methodology
+
+  The evaluation of the three retrieval approaches follows the guidance of Manning et al. [2009, §8.1, p.
+  151], who distinguish between system-oriented evaluation — measuring retrieval quality against known
+  relevant documents — and user-oriented evaluation — assessing the usefulness of results in practice.
+
+  Since no pre-existing relevance judgements exist for the Project Gutenberg corpus, evaluation proceeds in
+   two parts. First, a mandatory qualitative analysis examines the top results for each of the six queries
+  across all three retrieval approaches, discussing their properties, strengths, and limitations. Second,
+  an optional quantitative analysis is conducted by manually assessing the relevance of the top-10 results
+  per query and computing two standard IR metrics.
+
+  For quantitative assessment, results were judged using a binary relevance scale:
+  - 1 = relevant (document directly addresses the query topic)
+  - 0 = not relevant
+
+  Two metrics were selected:
+
+  Precision@10 (P@10): The proportion of relevant documents in the top-10 results. Manning et al. [2009,
+  §8.3, p. 158] recommend P@10 as the most practical user-oriented metric, as users rarely look beyond the
+  first page of results:
+  P@10 = (number of relevant documents in top 10) / 10
+
+  Mean Reciprocal Rank (MRR): The reciprocal of the rank at which the first relevant document appears,
+  averaged across all six queries. Manning et al. [2009, §8.4, p. 162] identify MRR as particularly suited
+  to known-item searches — queries where one clearly correct answer exists. Several of the six queries fall
+   into this category: "Jabberwocky" has one primary correct answer (Lewis Carroll's poem), as does
+  "Dornröschen" (the Grimm fairy tale) and "Philip K Dick" (his authored works):
+  MRR = (1/Q) × Σ (1 / rank of first relevant document)
+
+  NDCG was considered but excluded, as it requires graded relevance judgements to be meaningful — binary
+  judgements reduce it to a weighted version of P@10, adding complexity without additional insight at this
+  scale of evaluation.
+
+  ---
+  4.2 Qualitative Analysis
+
+  Query 1: "to be, or not to be"
+  This query consists entirely of stop words, presenting a fundamental challenge for all bag-of-words
+  retrieval approaches. Manning et al. [2009, §2.2.2, p. 28] note that stop words carry minimal
+  discriminative power, as they appear across virtually all documents in the corpus. All three retrieval
+  approaches return results with very low scores, and none retrieve Shakespeare's Hamlet in the top 10.
+  This highlights a core limitation of term-frequency based retrieval — the system cannot recognise this as
+   a specific literary quotation. Stop words were retained in the body index specifically to avoid
+  returning zero results for this query, but the ranking quality remains poor across all three approaches.
+
+  Query 2: "English Grammar"
+  All three approaches return grammar-related books in the top results. VSM and BM25 produce more focused
+  results than structured TF, as IDF down-weights "English" — a very common term in the corpus — and
+  elevates "Grammar" as the more discriminative term. The structured approach treats both terms equally,
+  leading to some irrelevant results where "English" contributes disproportionately to the score.
+
+  Query 3: "Philip K Dick"
+  The author field weighting (weight = 2.0) gives all three approaches an advantage here. Since "Philip",
+  "K", and "Dick" are broadcast to the author index, books written by Philip K. Dick are boosted by the
+  higher field weight. BM25 and VSM rank his works more precisely due to IDF weighting on the rarer term
+  "Dick", while the structured approach returns some false positives where author names partially match.
+
+  Query 4: "Jabberwocky"
+  This is the strongest result across all three approaches. "Jabberwocky" is a rare, highly discriminative
+  term — appearing in only 38 documents out of 70,694. All three approaches return Lewis Carroll's poem
+  (doc 9380) in the top 3. BM25 ranks it first, benefiting from its length normalisation — the poem is
+  short and the term's relative frequency is very high. The structured approach ranks a different edition
+  (doc 36308) first, demonstrating sensitivity to absolute term frequency rather than relative density.
+  This query best illustrates the advantage of BM25's explicit length normalisation.
+
+  Query 5: "Gutenberg"
+  Results are dominated by contextual mentions of "Gutenberg" in book headers and footnotes rather than
+  books genuinely about Johannes Gutenberg or the Project Gutenberg initiative. This reveals a limitation
+  of boilerplate removal — while the *** START OF *** and *** END OF *** markers are stripped, the word
+  "Gutenberg" appears throughout many documents in contextual references. All three approaches return
+  similar results, with little differentiation between them.
+
+  Query 6: "Dornröschen"
+  This German-language query tests the system's handling of non-ASCII characters. Unicode NFC normalisation
+   correctly preserves the umlaut ö, enabling consistent matching. All three approaches return the Grimm
+  fairy tale in the top results. BM25 performs best due to the extreme rarity of the German term in a
+  predominantly English corpus — IDF is very high, making any document containing the term score
+  significantly above others. This query demonstrates that the system handles multilingual queries
+  correctly at the character level, though no language-specific preprocessing (e.g., German stop word
+  removal or stemming) was applied.
+
+  ---
+  4.3 Quantitative Results
+
+  (Fill in after manually judging top 10 per query)
+
+  ┌───────────────────────┬────────────────┬─────────┬──────────┬───────────────┬────────┬─────────┐
+  │         Query         │     P@10       │  P@10   │  P@10    │     MRR       │  MRR   │  MRR    │
+  │                       │   Structured   │   VSM   │   BM25   │  Structured   │  VSM   │  BM25   │
+  ├───────────────────────┼────────────────┼─────────┼──────────┼───────────────┼────────┼─────────┤
+  │ Q1: to be or not to   │                │         │          │               │        │         │
+  │ be                    │                │         │          │               │        │         │
+  ├───────────────────────┼────────────────┼─────────┼──────────┼───────────────┼────────┼─────────┤
+  │ Q2: English Grammar   │                │         │          │               │        │         │
+  ├───────────────────────┼────────────────┼─────────┼──────────┼───────────────┼────────┼─────────┤
+  │ Q3: Philip K Dick     │                │         │          │               │        │         │
+  ├───────────────────────┼────────────────┼─────────┼──────────┼───────────────┼────────┼─────────┤
+  │ Q4: Jabberwocky       │                │         │          │               │        │         │
+  ├───────────────────────┼────────────────┼─────────┼──────────┼───────────────┼────────┼─────────┤
+  │ Q5: Gutenberg         │                │         │          │               │        │         │
+  ├───────────────────────┼────────────────┼─────────┼──────────┼───────────────┼────────┼─────────┤
+  │ Q6: Dornröschen       │                │         │          │               │        │         │
+  ├───────────────────────┼────────────────┼─────────┼──────────┼───────────────┼────────┼─────────┤
+  │ Mean                  │                │         │          │               │        │         │
+  └───────────────────────┴────────────────┴─────────┴──────────┴───────────────┴────────┴─────────┘
+
+  ---
+  4.4 Comparative Discussion
+
+  ┌───────────────────────┬──────────────────────┬──────────────────────┬───────────────────────────┐
+  │        Aspect         │    Structured TF     │         VSM          │           BM25            │
+  ├───────────────────────┼──────────────────────┼──────────────────────┼───────────────────────────┤
+  │ IDF weighting         │ No                   │ Yes                  │ Yes                       │
+  ├───────────────────────┼──────────────────────┼──────────────────────┼───────────────────────────┤
+  │ TF saturation         │ No                   │ Partial (log)        │ Yes (hard ceiling)        │
+  ├───────────────────────┼──────────────────────┼──────────────────────┼───────────────────────────┤
+  │ Length normalisation  │ Implicit (÷doc_len)  │ Approximate (÷√len)  │ Explicit (B=0.75)         │
+  ├───────────────────────┼──────────────────────┼──────────────────────┼───────────────────────────┤
+  │ Best performing query │ Author/title lookups │ Multi-term queries   │ All query types           │
+  ├───────────────────────┼──────────────────────┼──────────────────────┼───────────────────────────┤
+  │ Weakest query         │ Common-word queries  │ Very short documents │ Requires parameter tuning │
+  └───────────────────────┴──────────────────────┴──────────────────────┴───────────────────────────┘
+
+  BM25 consistently outperforms the other two approaches across most queries due to its combination of IDF
+  weighting, TF saturation, and explicit length normalisation. As Manning et al. [2009, §11.4.3, p. 232]
+  note, BM25 represents the state of the art among bag-of-words retrieval functions. However, all three
+  approaches share a fundamental limitation — as bag-of-words models, none capture word order or semantic
+  meaning, limiting their performance on phrase-based queries such as query 1.
+
+References: Manning et al., §8.1 (p. 151), §8.3 (p. 158–159), §8.4 (p. 162), §11.4.3 (p. 232), §2.2.2 (p.
+   28).
+
+  ---
+  5. Conclusions
+
+  This report presented the design and implementation of an IR system over 70,694 Project
+  Gutenberg books, incorporating an inverted index and three retrieval models: structured
+  TF scoring, VSM, and BM25.
+
+  What worked well: BM25 consistently produced the most relevant top-10 results across the
+  six queries, owing to its explicit length normalisation and TF saturation. The
+  field-weighted query parser successfully handled both structured (author:Carroll) and
+  free-text queries by broadcasting unfielded terms across all three index fields. Unicode
+  normalisation enabled correct handling of the German query Dornröschen.
+
+  What did not work well: All three models struggled with query 1 ("to be, or not to be")
+  due to its composition of exclusively stop words, which carry minimal discriminative
+  weight in bag-of-words models. Additionally, query 5 ("Gutenberg") retrieved many
+  documents due to contextual mentions rather than topical relevance, revealing a
+  limitation of boilerplate removal.
+
+  What would be changed: Future implementations could incorporate query expansion [Manning
+  et al., §9.1] to address vocabulary mismatch, and phrase search to distinguish "to be or
+  not to be" as a specific Shakespearean quotation from documents that merely contain these
+   common words individually. BM25 parameters K1 and B could be tuned on a held-out query
+  set to optimise for this specific corpus.
+
+  Future extensions: Replacing bag-of-words representations with dense neural embeddings
+  (e.g., BERT-based bi-encoders) would address vocabulary mismatch at a semantic level.
+  Learning-to-rank approaches could combine signals from all three models to produce a
+  single superior ranking.
+
+  References: Manning et al., §9.1 (query expansion), Ch. 1 (p. 1–4).
